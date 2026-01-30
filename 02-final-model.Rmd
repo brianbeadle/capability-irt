@@ -1,0 +1,963 @@
+---
+title: 'Capabilities Index'
+author: "Brian Beadle"
+date: "`r Sys.Date()`"
+output:
+  rmdformats::material:
+    self_contained: true
+    thumbnails: false
+    lightbox: false
+    gallery: false
+    highlight: tango
+    fig_width: 11
+    fig_height: 7
+---
+
+```{r, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Summary
+
+the following document generates a capabilities index using data from the RuWell project in the Balkan countries of Albania, Moldova, Kosovo, and Romania. It is a multidimensional index that predicts potential capability using a Bayesian graded response model estimated using the `brms` package. Factor analyses are used to determine the multidimensional structure of the data and to select the items. After fitting the model, posterior predictive checks and a k-folds cross-validation are used to determine model fit. Following the tests, overall model results are generated, then the latent traits (dimension-specific capabilities) are extracted and used in a series of auxiliary regressions.    
+
+# Setup
+
+Loading packages and setting options. Some files are particularly large, so I am also setting a higher global max size.
+
+```{r, message=FALSE, warning=FALSE}
+rm(list = ls())                     
+library(psych)
+library(haven)
+library(lavaan)
+library(brms)
+library(bayesplot)
+library(rstanarm)
+library(irr)
+library(dplyr)
+library(tidyr)
+library(tidyverse)
+library(tidySEM)
+library(tidybayes)
+library(knitr)
+library(nFactors)
+library(grid)
+library(gridExtra)
+library(viridis)
+library(qgraph)
+library(xtable)
+library(future)
+options(xtable.floating = FALSE)
+options(xtable.timestamp = "")
+options(future.globals.maxSize = 20 * 1024^3)
+```
+
+Loading data in wide format
+
+```{r}
+d <- read_dta("ruwell-final-wide.dta")
+```
+
+Specifying ordered factors for the y variables (potential items in the model)
+
+```{r}
+for (var in paste0("y", 1:38)) {
+  d[[var]] <- factor(d[[var]], levels = 1:5, ordered = TRUE)
+}
+```
+
+Subsetting variables for factor analysis (all y variables)
+
+```{r}
+vars <- d[, paste0("y", 1:38)]
+```
+
+# Factor analyses
+
+## Preliminary tests
+
+Computing polychoric correlation matrix to test if factor analysis is appropriate for the data set
+
+```{r}
+polychoric_corr <- polychoric(vars)$rho
+```
+
+Conducting Bartletts test of sphericity
+
+```{r}
+cortest.bartlett(polychoric_corr, n = nrow(d))
+```
+
+Running KMO test
+
+```{r}
+KMO(polychoric_corr)
+```
+
+## Fitting an exploratory model
+
+Specifying an EFA model with 3 factors
+
+```{r}
+fa3 <- fa(
+  r = polychoric_corr,
+  nfactors = 3,
+  fm = "mle",
+  rotate = "varimax"
+)
+```
+
+Displaying the factor loadings
+
+```{r}
+print(fa3$loadings)
+```
+
+Summarizing the results
+
+```{r}
+summary(fa3)
+```
+
+Display explained variance
+
+```{r}
+cat("Explained Variance")
+print(fa3$Vaccounted)
+```
+
+## Preparing the data for CFA
+
+Creating an object of the variables going into the model
+
+```{r}
+y_vars <- paste0("y", 1:38)
+```
+
+Converting specified variables to ordered factors
+
+```{r}
+for (var in y_vars) {
+  d[[var]] <- factor(d[[var]], 
+                     levels = sort(unique(d[[var]])), 
+                     ordered = TRUE)
+}
+```
+
+Sub-setting the data to include only the variables of interest
+
+```{r}
+vars <- d[, y_vars]
+```
+
+Setting row and column names for the polychoric correlation matrix
+
+```{r}
+rownames(polychoric_corr) <- y_vars
+colnames(polychoric_corr) <- y_vars
+```
+
+## Fitting the CFA model
+
+Defining the model
+
+```{r}
+cfa_model <- '
+  social =~ y1 + y35 + y37 + y38
+  personal =~ y6 + y9 + y12 + y24 + y27
+  environmental =~ y20 + y21 + y22
+  
+  social =~ y24
+  social =~ y6
+  social =~ y22
+  personal =~ y20
+'
+```
+
+Fitting the model using the polychoric correlation matrix
+
+```{r}
+fit1 <- cfa(cfa_model, sample.cov = polychoric_corr, sample.nobs = nrow(d))
+```
+
+Model summary
+
+```{r}
+summary(fit1, fit.measures = TRUE, standardized = TRUE)
+```
+
+## Cross-validation test
+
+Setting seed and selecting a 70% sample for training data
+
+```{r}
+set.seed(82)                                
+n <- nrow(d)  
+train <- sample(1:n, size = round(0.7 * n))  
+```
+
+Splitting the data into training and validation sets
+
+```{r}
+d_train <- d[train, ]
+d_validate <- d[-train, ]
+```
+
+Fitting the model on the training data
+
+```{r}
+fit_train <- cfa(cfa_model, 
+                 data = d_train, 
+                 estimator = "WLSMV",  
+                 ordered = TRUE) 
+```
+
+Fitting the model on the validation data
+
+```{r}
+fit_validation <- cfa(cfa_model, 
+                      data = d_validate, 
+                      estimator = "WLSMV", 
+                      ordered = TRUE, 
+                      mimic = "lavaan")
+```
+
+Summarizing the training and validation models
+
+```{r}
+summary(fit_train)
+summary(fit_validation)
+```
+
+Extracting fit indices for training and validation models
+
+```{r}
+fit_train_indices <- fitMeasures(fit_train, 
+                                 c("cfi", "tli", "rmsea", "srmr"))
+fit_validation_indices <- fitMeasures(fit_validation, 
+                                      c("cfi", "tli", "rmsea", "srmr"))
+```
+
+Printing fit indices
+
+```{r, out.width='100%'}
+cat("Training Fit Indices:\n")
+print(fit_train_indices)
+
+cat("Validation Fit Indices:\n")
+print(fit_validation_indices)
+```
+
+# Summary statistics and data transformations
+
+## Filtering and formatting the data set
+
+Formatting covariates and id number
+
+```{r}
+d$female <- as.factor(d$female)
+d$id <- as.factor(d$id)            
+d$country <- factor(d$country, 
+                    labels = c("Albania", "Kosovo", "Moldova", "Romania"))
+d$age <- as.numeric(d$age)
+```
+
+Defining variable lists to reference later. Variables with prefix "y" are the response variables for the model, and others are used as covariates in the model and/or for the summary statistics. 
+
+```{r}
+covariates <- c("country", "age", "female")
+```
+
+```{r}
+vars_keep <- c(
+  "y1", "y35", "y37", "y38",            # Social
+  "y6", "y9", "y12", "y24", "y27",      # Personal
+  "y20", "y21", "y22"                   # Environmental
+)
+```
+
+Mapping the response variables to numeric dimensions
+
+```{r}
+dimension_mapping <- tibble(
+  original_item = c(
+    "y1", "y35", "y37", "y38",          # Social
+    "y6", "y9", "y12", "y24", "y27",    # Personal
+    "y20", "y21", "y22"                 # Environmental
+  ),
+  dimension = c(
+    rep(1, 4),  
+    rep(2, 5),  
+    rep(3, 3)
+  )
+)
+```
+
+The next block of code performs the following primary functions:
+  1. Drops variables that are not used for the models
+  2. Specifies response variables as numeric
+  3. Renumbers response variables to be consecutive
+  4. Generates a variable 'item' 
+
+```{r}
+d <- d %>%
+  select(id, all_of(covariates), all_of(vars_keep)) %>%
+  pivot_longer(
+    cols = all_of(vars_keep),         # Specify the columns to pivot
+    names_to = "original_item",       # Track original item name
+    values_to = "y"                   # Response variable
+  ) %>%
+  mutate(
+    y = as.numeric(y),                # Remove labels from `y`
+    item = dense_rank(original_item)  # Renumber items consecutively
+  ) %>%
+  left_join(dimension_mapping, by = "original_item") %>%
+  mutate(
+    y = as.ordered(y),
+    item = as.factor(item),           # Convert `item` to factor
+    dimension = as.factor(dimension)  # Convert `dimension` to factor
+  ) %>%
+  arrange(id, item)                   # Ensure proper order
+```
+
+Creating item labels for plots
+
+```{r}
+item_labels <- c(
+  "Belonging/inclusion in community",
+  "Feels attached to village",
+  "Feels no place compares to their village",
+  "Feels village is best place for them",
+  "Freedom of speech",
+  "Self-rated overall health",
+  "Condition of dwelling",
+  "Equal access to education",
+  "Self-rated financial security",
+  "Quality of water bodies",
+  "Quality of forests",
+  "Quality of air"
+)
+```
+
+```{r}
+head(d)
+```
+
+## Generating summary stats
+
+Creating object containing all summary stats
+
+```{r}
+summary_stats <- d %>%
+  select(id, country, age, female) %>%
+  distinct(id, .keep_all = TRUE) %>%
+  group_by(country) %>%
+  summarise(
+    `n` = n(),
+    `Age` = sprintf("%.2f (%.2f)", 
+                    mean(age, na.rm = TRUE), 
+                    sd(age, na.rm = TRUE)),
+    `Female` = sprintf("%.2f%%", 
+                    mean(as.numeric(as.character(female))) * 100),
+    `Male` = sprintf("%.2f%%", 
+                    (1 - mean(as.numeric(as.character(female)))) * 100)) %>%
+  rename(Country = country)
+```
+
+Calculating totals
+
+```{r}
+totals <- d %>%
+  summarise(
+    `Country` = "Total",
+    `n` = n(),
+    `Age` = sprintf("%.2f (%.2f)", 
+                    mean(age, na.rm = TRUE), 
+                    sd(age, na.rm = TRUE)),
+    `Female` = sprintf("%.2f%%", 
+                       mean(as.numeric(as.character(female))) * 100),
+    `Male` = sprintf("%.2f%%", 
+                     (1 - mean(as.numeric(as.character(female)))) * 100)
+  )
+```
+
+Generating a complete table
+
+```{r}
+final_table <- bind_rows(summary_stats, totals)
+lat_tab1 <- xtable(final_table, 
+                      caption = "Summary statistics by country", 
+                      label = "tab:summ_stats")
+```
+
+```{r}
+addtorow <- list()
+addtorow$pos <- list(nrow(final_table) - 1) 
+addtorow$command <- "\\hline" 
+```
+
+Exporting the table as a LaTeX file
+
+```{r, out.width='100%'}
+print(lat_tab1, 
+      file = "table1-summ_stats.tex", 
+      include.rownames = FALSE,
+      floating = TRUE,
+      table.placement = "htbp",
+      add.to.row = addtorow)
+```
+
+# Graded response model (the capabilities index)
+
+## Model specification
+
+Specifying the model with age and country fixed effects and a random effects parameter that allows for freely-estimated covariances among the dimensions. Two models are created for the 1PL and 2PL versions (respectively), with the latter conditioning on an item-specific discrimination parameter.
+
+```{r}
+formula1pl <- bf(
+  y ~ 1 + country + s(age, by = country, bs = "tp") + # Fixed effects 
+    (1 + dimension | item) + (0 + dimension | id)     # Random effects terms
+)
+
+formula2pl <- bf(
+  y ~ 1 + country + s(age, by = country, bs = "tp") + # Fixed effects 
+    (1 + dimension | item) + (0 + dimension | id),    # Random effects terms
+  disc ~ 1 + (1 | item)                               # Discrimination parameter
+)
+```
+
+## Setting priors
+
+Retrieving prior suggestions for the more complex model
+
+```{r}
+get_prior(
+  formula = formula2pl,
+  data = d,
+  family = brmsfamily("cumulative", "logit", threshold = "flexible")
+)
+```
+
+Specifying the priors for the 1PL and 2PL models. Broad weakly informative priors are used so the data dominates the posterior estimates. These can be tightened further if the postestimation tests detect weak predictive performance, or if there are convergence issues in the model summaries. The prior objects are identical for the 1PL and 2PL models, with the exception of the tight prior on the discrimination parameter for the 2PL model.
+
+```{r}
+prior1pl <- 
+  prior(lkj(1), class = "cor") +
+  prior(normal(0, 5), class = "sd") +
+  prior(normal(0, 5), class = "sds") +
+  prior(normal(0, 5), class = "b") +
+  prior(normal(0, 5), class = "Intercept")
+
+prior2pl <- 
+  prior(lkj(1), class = "cor") +
+  prior(normal(0, 5), class = "sd") +
+  prior(normal(0, 5), class = "sds") +
+  prior(normal(0, 5), class = "b") +
+  prior(normal(0, 5), class = "Intercept") +
+  prior(normal(0, 1), class = "Intercept", dpar = "disc") 
+```
+
+## Fitting the models
+
+Running the models. Both models use identical options that include larger adapt deltas and tree depths to improve convergence, 3000 iterations with 1500 warmup, and a refresh rate of 100 iterations to check progress during model fits.
+
+```{r}
+fit1pl <- brm(
+  formula = formula1pl,
+  data = d,  
+  family = brmsfamily("cumulative", "logit", threshold = "flexible"),
+  prior = prior1pl,
+  cores = 4,  
+  chains = 4,  
+  iter = 3000,  
+  warmup = 1500,
+  control = list(adapt_delta = 0.99, max_treedepth = 15), 
+  save_pars = save_pars(all = TRUE),
+  refresh = 100,
+  silent = FALSE,
+  file = "02-ruwell-1PL.rds"
+)
+```
+
+```{r}
+fit2pl <- brm(
+  formula = formula2pl,
+  data = d,  
+  family = brmsfamily("cumulative", "logit", threshold = "flexible"),
+  prior = prior2pl,
+  cores = 4,  
+  chains = 4,  
+  iter = 3000,  
+  warmup = 1500,
+  control = list(adapt_delta = 0.99, max_treedepth = 15), 
+  save_pars = save_pars(all = TRUE),
+  refresh = 100,
+  silent = FALSE,
+  file = "02-ruwell-2PL.rds"
+)
+```
+
+## Model summaries
+
+Model summaries for the 1PL version
+
+```{r, out.width='100%'}
+summary(fit1pl)
+plot(fit1pl)
+```
+
+Model summaries for the 2PL version
+
+```{r, out.width='100%'}
+summary(fit2pl)
+plot(fit2pl)
+```
+
+## K-folds cross-validation
+
+The following cross validation is used to determine if the 1PL or the 2PL model should be used in the analysis.
+
+Generating a fold id to be grouped by person and country
+
+```{r}
+id_folds <- d %>%
+  distinct(id, country) %>%
+  group_by(country) %>%
+  mutate(fold = sample(rep(1:5, length.out = n()))) %>%
+  ungroup() %>%
+  select(id, fold)
+
+d <- d %>% left_join(id_folds, by = "id")
+```
+
+Running k-folds and writing the .rds to file
+
+```{r}
+if (!file.exists("kfold_1pl.rds")) {
+  plan(multisession, workers = 5)
+  kfold_1pl <- kfold(fit1pl, folds = d$fold, chains = 1, recompile = FALSE)
+  plan(sequential)
+  saveRDS(kfold_1pl, "kfold_1pl.rds")
+} else {
+  kfold_1pl <- readRDS("kfold_1pl.rds")
+}
+
+if (!file.exists("kfold_2pl.rds")) {
+  plan(multisession, workers = 5)
+  kfold_2pl <- kfold(fit2pl, folds = d$fold, chains = 1, recompile = FALSE)
+  plan(sequential)
+  saveRDS(kfold_2pl, "kfold_2pl.rds")
+} else {
+  kfold_2pl <- readRDS("kfold_2pl.rds")
+}
+```
+
+Comparing the models
+
+```{r}
+loo_compare(kfold_1pl, kfold_2pl)
+```
+
+## Posterior predictive checks
+
+Bars chart to compare the predicted vs observed response frequencies of each category
+
+```{r}
+plot2b <- pp_check(fit2pl, type = "bars", ndraws = 100) + 
+          labs(title = "Posterior predictive check (bars)")
+
+ggsave("plot2b-ppc-bars.pdf", 
+       plot = plot2b, width = 9, height = 6)
+```
+
+```{r, out.width='100%'}
+print(plot2b)
+```
+
+The empirical cumulative distribution function
+
+```{r}
+plot3b <- pp_check(fit2pl, type = "ecdf_overlay", ndraws = 100) +
+          labs(title = "Posterior predictive check (ECDF)")
+
+ggsave("plot3b-ppc-ecdf.pdf", 
+       plot = plot3b, width = 9, height = 6)
+```
+
+```{r, out.width='100%'}
+print(plot3b)
+```
+
+Plotting the predicted vs observed means and standard deviations
+
+```{r}
+plot4b <- pp_check(fit2pl, 
+          type = "stat_2d", 
+          stat = c("mean", "sd"), 
+          ndraws = 1000) +  
+         labs(title = "Posterior predictive check (2d stat)")
+
+ggsave("plot4b-ppc-2d.pdf", 
+       plot = plot4b, width = 9, height = 6)
+```
+
+```{r, out.width='100%'}
+print(plot4b)
+```
+
+# GRM results
+
+This section produces the plots used for the paper. This includes the easiness and discrimination parameter estimates, the MCMC draws of the fixed effect for the country covariate, and the predicted probabilities by country
+
+
+## Easiness and discrimination parameters
+
+Extracting the random effects. This object contains all random effects, and is additionally used to extract the latent traits for the auxiliary regressions
+
+```{r}
+ranef1 <- ranef(fit2pl)
+str(ranef1)
+```
+
+Estimating discrimination parameter
+
+```{r}
+alpha <- ranef1$item[, , "disc_Intercept"] %>%
+  exp() %>% 
+  as_tibble() %>%
+  rownames_to_column()
+```
+
+Estimating easiness parameter
+
+```{r}
+beta <- ranef1$item[, , "Intercept"] %>%
+  as_tibble() %>%
+  rownames_to_column()
+```
+
+Combining parameters to one plot
+
+```{r, message=FALSE, warning=FALSE}
+plot6b <- bind_rows(beta, alpha, .id = "nlpar") %>%
+  rename(item = "rowname") %>%
+  mutate(item = as.numeric(item)) %>%
+  mutate(nlpar = factor(
+  nlpar,
+  labels = c("Easiness", "Discrimination")
+  )) %>%
+  ggplot(aes(item, Estimate, ymin = Q2.5, ymax = Q97.5)) +
+  facet_wrap("nlpar", scales = "free_x") +
+  geom_pointrange() +
+  coord_flip() +
+  labs(x = "") + 
+  scale_x_discrete(limits = 1:12, labels = item_labels) +
+  theme_minimal() 
+
+ggsave("plot6b-easidisc.pdf", 
+       plot = plot6b, width = 9, height = 6)
+```
+
+```{r, out.width='100%'}
+print(plot6b)
+```
+
+## MCMC draws of the country covariate
+
+Extracting posterior draws
+
+```{r}
+posterior <- as.array(fit2pl)
+
+dim(posterior)
+```
+
+Plotting the draws by each value of country
+
+```{r}
+plot7b <- mcmc_areas(
+          posterior, 
+          pars = c("b_countryKosovo", "b_countryMoldova", "b_countryRomania"),
+          prob = 0.8,         # 80% inner intervals
+          prob_outer = 0.95,  # 95% outer intervals
+          point_est = "mean"
+         ) +
+        scale_y_discrete(labels = c("b_countryKosovo" = "Kosovo",
+                                    "b_countryMoldova" = "Moldova",
+                                    "b_countryRomania" = "Romania")) +
+        labs(title = "Posterior Intervals for Country Effects",
+          x = "Estimate",
+          y = "Country") 
+
+ggsave("plot7b-mcmc-country.pdf", 
+       plot = plot7b, width = 9, height = 6)
+```
+
+```{r, out.width='100%'}
+print(plot7b)
+```
+
+## Predicted probabilities by country
+
+Generating a conditional effects plot by country
+
+```{r}
+plot8b <- plot(
+  conditional_effects(
+    fit2pl, 
+    re_formula = NULL,  
+    categorical = TRUE, 
+    prob = 0.8,
+    effect = "country"
+  ), 
+  plot = FALSE)[[1]] +
+  theme_minimal() +
+  labs(
+    #title = "Predicted probabilities by country",
+    x = "", 
+    y = "Predicted probability"
+  )
+
+ggsave("plot8b-predprobs-country.pdf", 
+       plot = plot8b, width = 9, height = 6)
+```
+
+```{r, out.width='100%'}
+print(plot8b)
+```
+
+Plotting conditional smooths (mu) for age by country
+
+```{r, out.width='100%'}
+mu_fit2pl <- conditional_smooths(
+    fit2pl,
+    smooths = NULL,
+    prob = 0.9
+  )
+
+plot_data <- mu_fit2pl$mu
+
+plot9b <- ggplot(plot_data, 
+                 aes(x = age, 
+                     y = estimate__, 
+                     color = country, 
+                     fill = country)) +
+  geom_ribbon(aes(ymin = lower__, ymax = upper__), alpha = 0.2, color = NA) +
+  geom_line(linewidth = 1) +
+  coord_cartesian(ylim = c(-4, NA)) +
+  labs(
+    #title = "Age effects by country",
+    x = "Age", 
+    y = "μ", 
+    color = "Country", 
+    fill = "Country") +
+  theme_minimal()
+
+ggsave("plot9b-age-smooths-country.pdf", 
+       plot = plot9b, width = 9, height = 6)
+
+print(plot9b)
+```
+
+# Auxiliary regressions (latent trait models)
+
+## Data prep
+
+Extracting the latent traits into a second data set
+
+```{r}
+d2 <- d %>%
+  select(id, all_of(covariates)) %>%
+  distinct() %>%  # Keep only one row per person
+  mutate(
+    # Dimension-specific random effects
+    theta_dim1 = ranef1$id[as.character(id), "Estimate", "dimension1"],
+    theta_dim2 = ranef1$id[as.character(id), "Estimate", "dimension2"], 
+    theta_dim3 = ranef1$id[as.character(id), "Estimate", "dimension3"],
+    # Standard errors
+    se_dim1 = ranef1$id[as.character(id), "Est.Error", "dimension1"],
+    se_dim2 = ranef1$id[as.character(id), "Est.Error", "dimension2"],
+    se_dim3 = ranef1$id[as.character(id), "Est.Error", "dimension3"]
+  )
+```
+
+Checking extraction results
+
+```{r}
+head(d2)
+nrow(d2)
+```
+
+## Specifying the regression models
+
+Social dimension
+
+```{r}
+formula2 <- bf(
+  theta_dim1 | se(se_dim1, sigma = TRUE) ~ 
+    country + s(age, by = country, bs = "tp")
+)
+```
+
+Personal dimension
+
+```{r}
+formula3 <- bf(
+  theta_dim2 | se(se_dim2, sigma = TRUE) ~ 
+    country + s(age, by = country, bs = "tp")
+)
+```
+
+Environmental dimension
+
+```{r}
+formula4 <- bf(
+  theta_dim3 | se(se_dim3, sigma = TRUE) ~ 
+    country + s(age, by = country, bs = "tp")
+)
+```
+
+## Establishing a global prior function
+
+Checking suggested priors
+
+```{r}
+get_prior(
+  formula = formula2,
+  data = d2,
+  family = brmsfamily("gaussian")
+)
+```
+
+Setting weakly informative priors. This function will work for all three auxiliary regressions.
+
+```{r}
+prior2 <- c(
+  prior(normal(0, 5), class = "b"),
+  prior(normal(0, 5), class = "sds"),
+  prior(normal(0, 5), class = "Intercept"),
+  prior(normal(0, 5), class = "sigma")
+)
+```
+
+## Fitting the models
+
+Social model
+
+```{r}
+fit3 <- brm(
+  formula = formula2,
+  data = d2,
+  family = brmsfamily("gaussian"),
+  prior = prior2,
+  chains = 4,
+  iter = 4000,
+  warmup = 2000,
+  control = list(adapt_delta = 0.99),
+  cores = parallel::detectCores(),
+  file = "01-ruwell-FINAL2.rds"
+)
+```
+
+Personal model
+
+```{r}
+fit4 <- brm(
+  formula = formula3,
+  data = d2,
+  family = brmsfamily("gaussian"),
+  prior = prior2,
+  chains = 4,
+  iter = 4000,
+  warmup = 2000,
+  control = list(adapt_delta = 0.99),
+  cores = parallel::detectCores(),
+  file = "01-ruwell-FINAL3.rds"
+)
+```
+
+Environmental model
+
+```{r}
+fit5 <- brm(
+  formula = formula4,
+  data = d2,
+  family = brmsfamily("gaussian"),
+  prior = prior2,
+  chains = 4,
+  iter = 4000,
+  warmup = 2000,
+  control = list(adapt_delta = 0.99),
+  cores = parallel::detectCores(),
+  file = "01-ruwell-FINAL4.rds"
+)
+```
+
+Model summaries to check fits
+
+```{r}
+summary(fit3)  # Social
+summary(fit4)  # Personal
+summary(fit5)  # Environmental
+```
+
+# Auxiliary regression results
+
+```{r, out.width='100%'}
+# Helper function
+g_legend <- function(a.gplot) {
+ tmp <- ggplot_gtable(ggplot_build(a.gplot))
+ leg <- which(sapply(tmp$grobs, function(x) x$name) == "guide-box")
+ legend <- tmp$grobs[[leg]]
+ return(legend)
+}
+
+# Create plots with proper axis labels
+plot10b_clean <- plot(conditional_effects(fit3, effects = "age:country", robust = TRUE), plot = FALSE)[[1]] +
+ theme_minimal() + 
+ labs(title = "Social", x = "Age", y = expression(theta)) + 
+ theme(legend.position = "none")
+
+# Remove original ribbon, add new ribbon + mean line
+plot10b_clean$layers[[1]] <- NULL  
+plot10b_clean <- plot10b_clean + 
+ geom_ribbon(aes(ymin = lower__, ymax = upper__, fill = country), alpha = 0.2, color = NA) +
+ geom_line(aes(y = estimate__, color = country), linewidth = 1)
+
+plot11b_clean <- plot(conditional_effects(fit4, effects = "age:country", robust = TRUE), plot = FALSE)[[1]] +
+ theme_minimal() + 
+ labs(title = "Personal", x = "Age", y = expression(theta)) + 
+ theme(legend.position = "none") +
+ scale_y_continuous(position = "right")
+
+plot11b_clean$layers[[1]] <- NULL
+plot11b_clean <- plot11b_clean + 
+ geom_ribbon(aes(ymin = lower__, ymax = upper__, fill = country), alpha = 0.2, color = NA) +
+ geom_line(aes(y = estimate__, color = country), linewidth = 1)
+
+plot12b_clean <- plot(conditional_effects(fit5, effects = "age:country", robust = TRUE), plot = FALSE)[[1]] +
+ theme_minimal() + 
+ labs(title = "Environmental", x = "Age", y = expression(theta)) + 
+ theme(legend.position = "none")
+
+plot12b_clean$layers[[1]] <- NULL
+plot12b_clean <- plot12b_clean + 
+ geom_ribbon(aes(ymin = lower__, ymax = upper__, fill = country), alpha = 0.2, color = NA) +
+ geom_line(aes(y = estimate__, color = country), linewidth = 1)
+
+# Extract legend
+legend <- g_legend(
+  plot(conditional_effects(fit3, effects = "age:country", robust = TRUE), 
+       plot = FALSE)[[1]] + 
+    theme_minimal() +
+    labs(color = "Country", fill = "Country")
+)
+
+# Combine without header
+combined_grid <- grid.arrange(
+ plot10b_clean, plot11b_clean, plot12b_clean, legend,
+ ncol = 2, nrow = 2
+)
+
+ggsave("13b-combined-theta-grid.pdf", combined_grid, width = 9, height = 10)
+```
