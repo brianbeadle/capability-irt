@@ -1,3 +1,3 @@
-# Probabilistic perspectives of well-being: Bayesian item response modeling and the capability approach
+# Bayesian item response modeling and the capability approach
 
-This repository contains all files required for replicating a multidimensionally modeling Sen's capability approach using a graded response model.
+This repository is currently under construction. Detailed explanations of the file structure and replication steps will be published soon.
